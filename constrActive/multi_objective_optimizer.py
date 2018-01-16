@@ -35,14 +35,16 @@ class ParetoGraphOptimizer(object):
             self,
             grammar=None,
             multiobj_est=None,
-            max_n_neighbors=None,
+            expand_max_n_neighbors=None,
             n_iter=100,
+            expand_max_frontier=1,
             random_state=1):
         """init."""
         self.grammar = grammar
         self.multiobj_est = multiobj_est
-        self.max_nn = max_n_neighbors
+        self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
+        self.expand_max_frontier = expand_max_frontier
         self.pareto_set = dict()
         self.curr_iter = 0
         self.knn_ref_dist = None
@@ -57,12 +59,12 @@ class ParetoGraphOptimizer(object):
         """Optimize iteratively."""
         assert(self.grammar.is_fit())
         assert(self.multiobj_est.is_fit())
-        seed_graph = self._init_pareto(reference_graphs)
+        seed_graphs = self._init_pareto(reference_graphs)
         # iterate
         last(
             islice(
                 iterate(
-                    self._update_pareto_set, seed_graph), self.n_iter))
+                    self._update_pareto_set, seed_graphs), self.n_iter))
         graphs = self.pareto_set
         return self._rank(graphs)
 
@@ -76,11 +78,12 @@ class ParetoGraphOptimizer(object):
         costs = self.multiobj_est.decision_function(start_graphs)
         self.pareto_set = get_pareto_set(start_graphs, costs)
         self._log_init_pareto(reference_graphs, start_graphs, self.pareto_set)
-        seed_graph = random.choice(self.pareto_set)
-        return seed_graph
+        num = min(len(self.pareto_set), self.expand_max_frontier)
+        seed_graphs = random.sample(self.pareto_set, num)
+        return seed_graphs
 
     def _get_neighbors(self, graph):
-        n = self.max_nn
+        n = self.expand_max_n_neighbors
         if n is None:
             return self.grammar.neighbors(graph)
         else:
@@ -92,16 +95,23 @@ class ParetoGraphOptimizer(object):
         costs, graphs = zip(*costs_graphs)
         return graphs
 
-    def _update_pareto_set(self, seed_graph):
+    def _update_pareto_set(self, seed_graphs):
         """_update_pareto_set."""
-        n_graphs = list(self._get_neighbors(seed_graph))
-        if n_graphs:
-            graphs = n_graphs + self.pareto_set
+        neighbor_graphs = pipe(seed_graphs,
+                               map(self._get_neighbors),
+                               concat,
+                               list)
+        if neighbor_graphs:
+            graphs = neighbor_graphs + self.pareto_set
+            # TODO: do not recompute costs on old graphs
             costs = self.multiobj_est.decision_function(graphs)
             self.pareto_set = get_pareto_set(graphs, costs)
-            self._log_update_pareto_set(costs, self.pareto_set, n_graphs)
-        new_seed_graph = random.choice(self.pareto_set)
-        return new_seed_graph
+            self._log_update_pareto_set(costs,
+                                        self.pareto_set,
+                                        neighbor_graphs)
+        num = min(len(self.pareto_set), self.expand_max_frontier)
+        new_seed_graphs = random.sample(self.pareto_set, num)
+        return new_seed_graphs
 
     def _log_init_pareto(self, reference_graphs, start_graphs, pareto_set):
         ref_size = len(reference_graphs)
@@ -113,16 +123,16 @@ class ParetoGraphOptimizer(object):
         txt += 'for a pareto set of size: %3d ' % par_size
         logger.debug(txt)
 
-    def _log_update_pareto_set(self, costs, pareto_set, n_graphs):
+    def _log_update_pareto_set(self, costs, pareto_set, neighbor_graphs):
         self.curr_iter += 1
         min_dist = min(costs[:, 0])
         par_size = len(pareto_set)
         med_dist = np.percentile(costs[:, 0], 50)
         txt = 'iter: %3d ' % self.curr_iter
-        txt += 'current min dist: %.6f ' % min_dist
-        txt += 'median dist: %.6f ' % med_dist
+        txt += 'current min dist: %.7f ' % min_dist
+        txt += 'median dist: %.7f ' % med_dist
         txt += 'in pareto set of size: %3d ' % par_size
-        txt += 'expanding: %3d ' % len(n_graphs)
+        txt += 'add n neighbors: %4d ' % len(neighbor_graphs)
         logger.debug(txt)
 
 # -----------------------------------------------------------------------------
@@ -136,13 +146,15 @@ class LocalLandmarksDistanceOptimizer(object):
             r=3,
             d=3,
             min_count=1,
-            max_n_neighbors=None,
+            expand_max_n_neighbors=None,
             n_iter=20,
-            k_best=5):
+            expand_max_frontier=1,
+            output_k_best=5):
         """init."""
-        self.max_n_neighbors = max_n_neighbors
+        self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
-        self.k_best = k_best
+        self.expand_max_frontier = expand_max_frontier
+        self.output_k_best = output_k_best
         decomposition_args = {
             "radius_list": [0, 1, 2, 3],
             "thickness_list": [2]}
@@ -172,38 +184,15 @@ class LocalLandmarksDistanceOptimizer(object):
         pgo = ParetoGraphOptimizer(
             grammar=self.grammar,
             multiobj_est=self.multiobj_est,
-            max_n_neighbors=self.max_n_neighbors,
+            expand_max_n_neighbors=self.expand_max_n_neighbors,
+            expand_max_frontier=self.expand_max_frontier,
             n_iter=self.n_iter)
         graphs = pgo.optimize(reference_graphs)
 
         # output a selection of the Pareto set
-        graphs = self.multiobj_est.select(graphs, k_best=self.k_best)
+        graphs = self.multiobj_est.select(graphs, k_best=self.output_k_best)
         return graphs
 
-
-def construct(
-        reference_graphs,
-        desired_distances,
-        loc_graphs,
-        r=2,
-        d=5,
-        min_count=1,
-        max_n_neighbors=None,
-        n_iter=20,
-        k_best=5):
-    """construct."""
-    ld_opt = LocalLandmarksDistanceOptimizer(
-        r=r,
-        d=d,
-        min_count=min_count,
-        max_n_neighbors=max_n_neighbors,
-        n_iter=n_iter,
-        k_best=k_best)
-    graphs = ld_opt.optimize(
-        reference_graphs,
-        desired_distances,
-        loc_graphs)
-    return graphs
 
 # -----------------------------------------------------------------------------
 
@@ -216,16 +205,18 @@ class LandmarksDistanceOptimizer(object):
             r=3,
             d=3,
             min_count=1,
-            max_n_neighbors=None,
+            expand_max_n_neighbors=None,
             n_iter=20,
-            k_best=5,
+            expand_max_frontier=1,
+            output_k_best=5,
             improve=True):
         """init."""
         self.r = r
         self.d = d
-        self.max_n_neighbors = max_n_neighbors
+        self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
-        self.k_best = k_best
+        self.expand_max_frontier = expand_max_frontier
+        self.output_k_best = output_k_best
         self.improve = improve
         decomposition_args = {
             "radius_list": [0, 1, 2, 3],
@@ -260,12 +251,13 @@ class LandmarksDistanceOptimizer(object):
         pgo = ParetoGraphOptimizer(
             grammar=self.grammar,
             multiobj_est=self.multiobj_est,
-            max_n_neighbors=self.max_n_neighbors,
+            expand_max_n_neighbors=self.expand_max_n_neighbors,
+            expand_max_frontier=self.expand_max_frontier,
             n_iter=self.n_iter)
         graphs = pgo.optimize(reference_graphs)
 
         # output a selection of the Pareto set
-        graphs = self.multiobj_est.select(graphs, k_best=self.k_best)
+        graphs = self.multiobj_est.select(graphs, k_best=self.output_k_best)
         return graphs
 
 
@@ -278,17 +270,17 @@ class NearestNeighborsMeanOptimizer(object):
     def __init__(
             self,
             min_count=2,
-            max_n_neighbors=None,
+            expand_max_n_neighbors=None,
             r=3,
             d=3,
             n_landmarks=5,
             n_neighbors=100,
             n_iter=20,
-            k_best=5,
+            expand_max_frontier=1,
+            output_k_best=5,
             max_num_solutions=30,
             improve=True):
         """init."""
-        self.improve = improve
         self.max_num = max_num_solutions
         self.n_landmarks = n_landmarks
         self.n_neighbors = n_neighbors
@@ -307,9 +299,10 @@ class NearestNeighborsMeanOptimizer(object):
             r=r,
             d=d,
             min_count=min_count,
-            max_n_neighbors=max_n_neighbors,
+            expand_max_n_neighbors=expand_max_n_neighbors,
             n_iter=n_iter,
-            k_best=k_best,
+            expand_max_frontier=expand_max_frontier,
+            output_k_best=output_k_best,
             improve=improve)
 
     def fit(self, pos_graphs, neg_graphs):
