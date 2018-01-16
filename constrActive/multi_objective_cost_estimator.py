@@ -42,7 +42,7 @@ class MultiObjectiveCostEstimator(object):
         """is_fit."""
         return self.estimators is not None
 
-    def select(self, graphs, k_best=10):
+    def select(self, graphs, k_best=10, objective=None):
         """select."""
         if k_best > len(graphs):
             return graphs
@@ -50,7 +50,10 @@ class MultiObjectiveCostEstimator(object):
         ranks = [rankdata(costs[:, i], method='min')
                  for i in range(costs.shape[1])]
         ranks = np.vstack(ranks).T
-        agg_ranks = np.sum(ranks, axis=1)
+        if objective is None:
+            agg_ranks = np.sum(ranks, axis=1)
+        else:
+            agg_ranks = ranks[:, objective]
         ids = np.argsort(agg_ranks)
         k_best_graphs = [graphs[id] for id in ids[:k_best]]
         return k_best_graphs

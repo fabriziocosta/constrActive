@@ -190,7 +190,9 @@ class LocalLandmarksDistanceOptimizer(object):
         graphs = pgo.optimize(reference_graphs)
 
         # output a selection of the Pareto set
-        graphs = self.multiobj_est.select(graphs, k_best=self.output_k_best)
+        graphs = self.multiobj_est.select(graphs,
+                                          k_best=self.output_k_best,
+                                          objective=0)
         return graphs
 
 
