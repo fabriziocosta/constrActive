@@ -20,19 +20,19 @@ class IdealGraphEstimator(object):
 
     def __init__(
             self,
-            min_count=2,
-            max_n_neighbors=100,
             r=3,
-            d=3,
+            d=6,
+            min_count=1,
             n_neighbors=10,
+            n_landmarks=5,
             max_num_solutions=30):
         """construct."""
-        self.min_count = min_count
-        self.max_n_neighbors = max_n_neighbors
-        self.max_num_solutions = max_num_solutions
         self.r = r
         self.d = d
+        self.min_count = min_count
         self.n_neighbors = n_neighbors
+        self.n_landmarks = n_landmarks
+        self.max_num_solutions = max_num_solutions
 
         self.clf = Perceptron(n_iter=500)
         self.vec = Vectorizer(r=r, d=d,
@@ -88,14 +88,15 @@ class IdealGraphEstimator(object):
         """construct."""
         args = dict(
             min_count=self.min_count,
-            max_n_neighbors=self.max_n_neighbors,
+            context_size=2,
+            expand_max_n_neighbors=None,
             r=self.r,
             d=self.d,
-            n_landmarks=5,
+            n_landmarks=self.n_landmarks,
             n_neighbors=self.n_neighbors,
-            n_iter=20,
-            k_best=5,
-            max_num_solutions=self.max_num_solutions)
+            n_iter=2,
+            expand_max_frontier=1000,
+            output_k_best=self.max_num_solutions)
         self.active_constr = NearestNeighborsMeanOptimizer(
             improve=False, **args)
         self.active_constr.fit(pos_graphs, neg_graphs)

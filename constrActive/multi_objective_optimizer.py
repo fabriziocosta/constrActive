@@ -145,10 +145,11 @@ class LocalLandmarksDistanceOptimizer(object):
             self,
             r=3,
             d=3,
+            context_size=2,
             min_count=1,
             expand_max_n_neighbors=None,
-            n_iter=20,
-            expand_max_frontier=1,
+            n_iter=2,
+            expand_max_frontier=1000,
             output_k_best=5):
         """init."""
         self.expand_max_n_neighbors = expand_max_n_neighbors
@@ -157,7 +158,7 @@ class LocalLandmarksDistanceOptimizer(object):
         self.output_k_best = output_k_best
         decomposition_args = {
             "radius_list": [0, 1, 2, 3],
-            "thickness_list": [2]}
+            "thickness_list": [context_size]}
         filter_args = {
             "min_cip_count": min_count,
             "min_interface_count": min_count}
@@ -206,6 +207,7 @@ class LandmarksDistanceOptimizer(object):
             self,
             r=3,
             d=3,
+            context_size=2,
             min_count=1,
             expand_max_n_neighbors=None,
             n_iter=20,
@@ -215,6 +217,7 @@ class LandmarksDistanceOptimizer(object):
         """init."""
         self.r = r
         self.d = d
+        self.context_size = context_size
         self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
         self.expand_max_frontier = expand_max_frontier
@@ -222,7 +225,7 @@ class LandmarksDistanceOptimizer(object):
         self.improve = improve
         decomposition_args = {
             "radius_list": [0, 1, 2, 3],
-            "thickness_list": [2]}
+            "thickness_list": [context_size]}
         filter_args = {
             "min_cip_count": min_count,
             "min_interface_count": min_count}
@@ -259,7 +262,9 @@ class LandmarksDistanceOptimizer(object):
         graphs = pgo.optimize(reference_graphs)
 
         # output a selection of the Pareto set
-        graphs = self.multiobj_est.select(graphs, k_best=self.output_k_best)
+        graphs = self.multiobj_est.select(graphs,
+                                          k_best=self.output_k_best,
+                                          objective=0)
         return graphs
 
 
@@ -272,6 +277,7 @@ class NearestNeighborsMeanOptimizer(object):
     def __init__(
             self,
             min_count=2,
+            context_size=2,
             expand_max_n_neighbors=None,
             r=3,
             d=3,
@@ -280,12 +286,11 @@ class NearestNeighborsMeanOptimizer(object):
             n_iter=20,
             expand_max_frontier=1,
             output_k_best=5,
-            max_num_solutions=30,
             improve=True):
         """init."""
-        self.max_num = max_num_solutions
         self.n_landmarks = n_landmarks
         self.n_neighbors = n_neighbors
+        self.output_k_best = output_k_best
         self.nn_estimator = NearestNeighbors(n_neighbors=n_neighbors)
         self.non_norm_vec = Vectorizer(
             r=r,
@@ -301,11 +306,13 @@ class NearestNeighborsMeanOptimizer(object):
             r=r,
             d=d,
             min_count=min_count,
+            context_size=context_size,
             expand_max_n_neighbors=expand_max_n_neighbors,
             n_iter=n_iter,
             expand_max_frontier=expand_max_frontier,
             output_k_best=output_k_best,
             improve=improve)
+        self.sim_est = VarSimVolCostEstimator(improve=improve)
 
     def fit(self, pos_graphs, neg_graphs):
         """fit."""
@@ -313,12 +320,11 @@ class NearestNeighborsMeanOptimizer(object):
         self.all_vecs = self.vec.transform(self.all_graphs)
         self.nn_estimator.fit(self.all_vecs)
         self.dist_opt.fit(pos_graphs, neg_graphs)
-        self.sim_est = VarSimVolCostEstimator(improve=self.improve)
         self.sim_est.fit(pos_graphs, neg_graphs)
 
     def optimize(self, graphs):
         """optimize."""
-        seed_graphs = self.select(graphs, max_num=self.max_num)
+        seed_graphs = self.select(graphs, max_num=self.output_k_best)
 
         # run optimization in parallel
         pareto_graphs_list = self._optimize_parallel(seed_graphs)
@@ -328,7 +334,7 @@ class NearestNeighborsMeanOptimizer(object):
         pareto_set_graphs = pipe(pareto_graphs_list, concat, list)
 
         # pareto filter using similarity of the solutions
-        sel_graphs = self.select(pareto_set_graphs, max_num=self.max_num)
+        sel_graphs = self.select(pareto_set_graphs, max_num=self.output_k_best)
         logger.debug('#constructed graphs:%5d' % (len(sel_graphs)))
         return sel_graphs
 
