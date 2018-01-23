@@ -5,7 +5,7 @@
 import random
 import numpy as np
 from toolz.itertoolz import iterate, last
-from toolz.curried import pipe, map, concat
+from toolz.curried import compose, pipe, map, concat
 from itertools import islice
 
 from graphlearn.lsgg import lsgg
@@ -20,12 +20,25 @@ from eden import apply_async
 
 
 from pareto_funcs import get_pareto_set
-from constrActive.multi_objective_cost_estimator import DistRankSizeCostEstimator
-from constrActive.multi_objective_cost_estimator import DistBiasSizeCostEstimator
-from constrActive.multi_objective_cost_estimator import VarSimVolCostEstimator
+import constrActive.multi_objective_cost_estimator as mobj
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+def _manage_int_or_float(input_val, ref_val):
+    assert (ref_val > 0), 'Error: ref val not >0'
+    out_val = None
+    if isinstance(input_val, int):
+        out_val = min(input_val, ref_val)
+    elif isinstance(input_val, float):
+        msg = 'val=%.3f should be >0 and <=1'
+        assert(0 < input_val <= 1), msg
+        out_val = int(input_val * float(ref_val))
+    else:
+        raise Exception('Error on val type')
+    out_val = max(out_val, 2)
+    return out_val
 
 
 class ParetoGraphOptimizer(object):
@@ -36,51 +49,58 @@ class ParetoGraphOptimizer(object):
             grammar=None,
             multiobj_est=None,
             expand_max_n_neighbors=None,
-            n_iter=100,
-            expand_max_frontier=1,
+            n_iter=19,
+            expand_max_frontier=20,
+            max_size_frontier=30,
+            adapt_grammar_n_iter=5,
             random_state=1):
         """init."""
         self.grammar = grammar
+        self.adapt_grammar_n_iter = adapt_grammar_n_iter
         self.multiobj_est = multiobj_est
         self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
         self.expand_max_frontier = expand_max_frontier
+        self.max_size_frontier = max_size_frontier
         self.pareto_set = dict()
-        self.curr_iter = 0
         self.knn_ref_dist = None
+
+        self.curr_iter = 0
+        self.prev_costs = None
         random.seed(random_state)
+        self._expand_neighbors = compose(list,
+                                         concat,
+                                         map(self._get_neighbors))
 
     def set_objectives(self, multiobj_est):
         """set_objectives."""
         self.multiobj_est = multiobj_est
 
+    def _mark_non_visited(self, graphs):
+        for g in graphs:
+            g.graph['visited'] = False
+
     @timeit
-    def optimize(self, reference_graphs):
+    def optimize(self, graphs):
         """Optimize iteratively."""
         assert(self.grammar.is_fit())
         assert(self.multiobj_est.is_fit())
-        seed_graphs = self._init_pareto(reference_graphs)
-        # iterate
-        last(
-            islice(
-                iterate(
-                    self._update_pareto_set, seed_graphs), self.n_iter))
-        graphs = self.pareto_set
-        return self._rank(graphs)
+        # init
+        costs = self.multiobj_est.decision_function(graphs)
+        seed_graphs = get_pareto_set(graphs, costs)
+        self.pareto_set = seed_graphs
+        self._mark_non_visited(self.pareto_set)
 
-    @timeit
-    def _init_pareto(self, reference_graphs):
-        start_graphs = pipe(
-            reference_graphs,
-            map(self._get_neighbors),
-            concat,
-            list)
-        costs = self.multiobj_est.decision_function(start_graphs)
-        self.pareto_set = get_pareto_set(start_graphs, costs)
-        self._log_init_pareto(reference_graphs, start_graphs, self.pareto_set)
-        num = min(len(self.pareto_set), self.expand_max_frontier)
-        seed_graphs = random.sample(self.pareto_set, num)
-        return seed_graphs
+        # main cycle
+        try:
+            last(islice(
+                iterate(self._update_pareto_set, seed_graphs),
+                self.n_iter))
+        except Exception as e:
+            msg = 'Terminated at iteration:%d because %s' % (self.curr_iter, e)
+            logger.debug(msg)
+        finally:
+            return self.pareto_set
 
     def _get_neighbors(self, graph):
         n = self.expand_max_n_neighbors
@@ -89,50 +109,74 @@ class ParetoGraphOptimizer(object):
         else:
             return self.grammar.neighbors_sample(graph, n_neighbors=n)
 
-    def _rank(self, graphs):
+    def _update_grammar_policy(self):
+        if self.curr_iter > 0 and \
+            self.adapt_grammar_n_iter is not None and \
+                self.curr_iter % self.adapt_grammar_n_iter == 0:
+            min_count = self.grammar.get_min_count()
+            min_count = min_count + 1
+            self.grammar.set_min_count(min_count)
+            self.grammar.reset_productions()
+            self.grammar.fit(self.pareto_set)
+            self._mark_non_visited(self.pareto_set)
+            logger.debug(self.grammar)
+
+    def _update_pareto_set_policy(self, neighbor_graphs):
+        graphs = self.pareto_set + neighbor_graphs
         costs = self.multiobj_est.decision_function(graphs)
-        costs_graphs = sorted(zip(costs, graphs), key=lambda x: x[0][0])
-        costs, graphs = zip(*costs_graphs)
-        return graphs
+        self.pareto_set = get_pareto_set(graphs, costs)
+        if self.max_size_frontier is not None:
+            # reduce Pareto set size by taking best ranking subset
+            m = self.max_size_frontier
+            n = len(self.pareto_set)
+            size = _manage_int_or_float(m, n)
+            self.pareto_set = self.multiobj_est.select(self.pareto_set, size)
+        return costs
+
+    def _update_pareto_set_expansion_policy(self):
+        size = _manage_int_or_float(self.expand_max_frontier,
+                                    len(self.pareto_set))
+        # permute the elements in the frontier
+        ids = np.arange(len(self.pareto_set))
+        np.random.shuffle(ids)
+        ids = list(ids)
+        # select non visited elements
+        is_visited = lambda g: g.graph.get('visited', False)
+        non_visited_ids = [id for id in ids
+                           if not is_visited(self.pareto_set[id])]
+        if len(non_visited_ids) == 0:
+            raise Exception('No non visited elements in frontier, stopping')
+        not_yet_visited_graphs = []
+        for id in non_visited_ids[:size]:
+            self.pareto_set[id].graph['visited'] = True
+            not_yet_visited_graphs.append(self.pareto_set[id])
+        return not_yet_visited_graphs
 
     def _update_pareto_set(self, seed_graphs):
         """_update_pareto_set."""
-        neighbor_graphs = pipe(seed_graphs,
-                               map(self._get_neighbors),
-                               concat,
-                               list)
-        if neighbor_graphs:
-            graphs = neighbor_graphs + self.pareto_set
-            # TODO: do not recompute costs on old graphs
-            costs = self.multiobj_est.decision_function(graphs)
-            self.pareto_set = get_pareto_set(graphs, costs)
-            self._log_update_pareto_set(costs,
-                                        self.pareto_set,
-                                        neighbor_graphs)
-        num = min(len(self.pareto_set), self.expand_max_frontier)
-        new_seed_graphs = random.sample(self.pareto_set, num)
-        return new_seed_graphs
-
-    def _log_init_pareto(self, reference_graphs, start_graphs, pareto_set):
-        ref_size = len(reference_graphs)
-        par_size = len(pareto_set)
-        n_start_graphs = len(start_graphs)
-        txt = 'Init pareto set: '
-        txt += 'starting from: %3d references ' % ref_size
-        txt += 'expanding in: %3d neighbors ' % n_start_graphs
-        txt += 'for a pareto set of size: %3d ' % par_size
-        logger.debug(txt)
-
-    def _log_update_pareto_set(self, costs, pareto_set, neighbor_graphs):
+        self._update_grammar_policy()
+        neighbor_graphs = self._expand_neighbors(seed_graphs)
+        costs = self._update_pareto_set_policy(neighbor_graphs)
+        new_seeds = self._update_pareto_set_expansion_policy()
+        self._log_update_pareto_set(
+            costs, self.pareto_set, neighbor_graphs, new_seeds)
         self.curr_iter += 1
-        min_dist = min(costs[:, 0])
+        return new_seeds
+
+    def _log_update_pareto_set(self,
+                               costs,
+                               pareto_set,
+                               neighbor_graphs,
+                               new_seed_graphs):
+        min_cost0 = min(costs[:, 0])
         par_size = len(pareto_set)
-        med_dist = np.percentile(costs[:, 0], 50)
-        txt = 'iter: %3d ' % self.curr_iter
-        txt += 'current min dist: %.7f ' % min_dist
-        txt += 'median dist: %.7f ' % med_dist
-        txt += 'in pareto set of size: %3d ' % par_size
-        txt += 'add n neighbors: %4d ' % len(neighbor_graphs)
+        med_cost0 = np.percentile(costs[:, 0], 50)
+        txt = 'iter: %3d \t' % self.curr_iter
+        txt += 'current min obj-0: %7.2f \t' % min_cost0
+        txt += 'median obj-0: %7.2f \t' % med_cost0
+        txt += 'added n neighbors: %4d \t' % len(neighbor_graphs)
+        txt += 'obtained pareto set of size: %4d \t' % par_size
+        txt += 'next round seeds: %4d ' % len(new_seed_graphs)
         logger.debug(txt)
 
 # -----------------------------------------------------------------------------
@@ -148,22 +192,23 @@ class LocalLandmarksDistanceOptimizer(object):
             context_size=2,
             min_count=1,
             expand_max_n_neighbors=None,
+            max_size_frontier=None,
             n_iter=2,
             expand_max_frontier=1000,
-            output_k_best=5):
+            output_k_best=None,
+            adapt_grammar_n_iter=None):
         """init."""
+        self.adapt_grammar_n_iter = adapt_grammar_n_iter
         self.expand_max_n_neighbors = expand_max_n_neighbors
         self.n_iter = n_iter
         self.expand_max_frontier = expand_max_frontier
+        self.max_size_frontier = max_size_frontier
         self.output_k_best = output_k_best
-        decomposition_args = {
-            "radius_list": [0, 1, 2, 3],
-            "thickness_list": [context_size]}
-        filter_args = {
-            "min_cip_count": min_count,
-            "min_interface_count": min_count}
-        self.grammar = lsgg(decomposition_args, filter_args)
-        self.multiobj_est = DistRankSizeCostEstimator(r=r, d=d)
+        self.grammar = lsgg()
+        self.grammar.set_core_size([0, 1, 2, 3])
+        self.grammar.set_context(context_size)
+        self.grammar.set_min_count(min_count)
+        self.multiobj_est = mobj.DistRankSizeCostEstimator(r=r, d=d)
 
     def fit(self):
         """fit."""
@@ -173,13 +218,15 @@ class LocalLandmarksDistanceOptimizer(object):
             self,
             reference_graphs,
             desired_distances,
-            loc_graphs):
+            ranked_graphs):
         """optimize."""
-        self.grammar.fit(loc_graphs)
+        self.grammar.fit(ranked_graphs)
         logger.debug(self.grammar)
 
         # fit objectives
-        self.multiobj_est.fit(desired_distances, reference_graphs, loc_graphs)
+        self.multiobj_est.fit(desired_distances,
+                              reference_graphs,
+                              ranked_graphs)
 
         # setup and run optimizer
         pgo = ParetoGraphOptimizer(
@@ -187,15 +234,19 @@ class LocalLandmarksDistanceOptimizer(object):
             multiobj_est=self.multiobj_est,
             expand_max_n_neighbors=self.expand_max_n_neighbors,
             expand_max_frontier=self.expand_max_frontier,
-            n_iter=self.n_iter)
-        graphs = pgo.optimize(reference_graphs)
+            max_size_frontier=self.max_size_frontier,
+            n_iter=self.n_iter,
+            adapt_grammar_n_iter=self.adapt_grammar_n_iter)
+        graphs = pgo.optimize(reference_graphs + ranked_graphs)
 
-        # output a selection of the Pareto set
-        graphs = self.multiobj_est.select(graphs,
-                                          k_best=self.output_k_best,
-                                          objective=0)
-        return graphs
-
+        if self.output_k_best is None:
+            return graphs
+        else:
+            # output a selection of the Pareto set
+            return self.multiobj_est.select(
+                graphs,
+                k_best=self.output_k_best,
+                objective=0)
 
 # -----------------------------------------------------------------------------
 
@@ -223,17 +274,14 @@ class LandmarksDistanceOptimizer(object):
         self.expand_max_frontier = expand_max_frontier
         self.output_k_best = output_k_best
         self.improve = improve
-        decomposition_args = {
-            "radius_list": [0, 1, 2, 3],
-            "thickness_list": [context_size]}
-        filter_args = {
-            "min_cip_count": min_count,
-            "min_interface_count": min_count}
-        self.grammar = lsgg(decomposition_args, filter_args)
+        self.grammar = lsgg()
+        self.grammar.set_core_size([0, 1, 2, 3])
+        self.grammar.set_context(context_size)
+        self.grammar.set_min_count(min_count)
 
     def fit(self, pos_graphs, neg_graphs):
         """fit."""
-        self.multiobj_est = DistBiasSizeCostEstimator(
+        self.multiobj_est = mobj.DistBiasSizeCostEstimator(
             pos_graphs,
             neg_graphs,
             r=self.r,
@@ -312,7 +360,7 @@ class NearestNeighborsMeanOptimizer(object):
             expand_max_frontier=expand_max_frontier,
             output_k_best=output_k_best,
             improve=improve)
-        self.sim_est = VarSimVolCostEstimator(improve=improve)
+        self.sim_est = mobj.VarSimVolCostEstimator(improve=improve)
 
     def fit(self, pos_graphs, neg_graphs):
         """fit."""

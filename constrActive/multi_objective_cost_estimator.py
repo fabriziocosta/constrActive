@@ -42,20 +42,43 @@ class MultiObjectiveCostEstimator(object):
         """is_fit."""
         return self.estimators is not None
 
-    def select(self, graphs, k_best=10, objective=None):
-        """select."""
-        if k_best > len(graphs):
-            return graphs
+    def _compute_ranks(self, graphs):
         costs = self.decision_function(graphs)
         ranks = [rankdata(costs[:, i], method='min')
                  for i in range(costs.shape[1])]
         ranks = np.vstack(ranks).T
-        if objective is None:
-            agg_ranks = np.sum(ranks, axis=1)
-        else:
-            agg_ranks = ranks[:, objective]
+        return ranks
+
+    def _select_avg_rank(self, ranks, k_best=10):
+        agg_ranks = np.sum(ranks, axis=1)
         ids = np.argsort(agg_ranks)
-        k_best_graphs = [graphs[id] for id in ids[:k_best]]
+        return ids[:k_best]
+
+    def _select_single_objective(self, ranks, k_best=10, objective=None):
+        agg_ranks = ranks[:, objective]
+        ids = np.argsort(agg_ranks)
+        if k_best == 1:
+            return ids[0]
+        else:
+            return ids[:k_best]
+
+    def _select_extremes(self, ranks):
+        n_objectives = ranks.shape[1]
+        ids = [self._select_single_objective(ranks, k_best=1, objective=i)
+               for i in range(n_objectives)]
+        ids = list(set(ids))
+        return ids
+
+    def select(self, graphs, k_best=10, objective=None):
+        """select."""
+        ranks = self._compute_ranks(graphs)
+        if objective is None:
+            ids = self._select_avg_rank(ranks, k_best)
+            ext_ids = self._select_extremes(ranks)
+            ids = list(set(list(ids) + list(ext_ids)))
+        else:
+            ids = self._select_single_objective(ranks, k_best, objective)
+        k_best_graphs = [graphs[id] for id in ids]
         return k_best_graphs
 
 

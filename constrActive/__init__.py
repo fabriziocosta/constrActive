@@ -13,9 +13,11 @@ def construct_from_neighbors(
         min_count=1,
         context_size=2,
         expand_max_n_neighbors=None,
+        max_size_frontier=None,
         n_iter=20,
         expand_max_frontier=1,
-        output_k_best=5):
+        output_k_best=None,
+        adapt_grammar_n_iter=None):
     """construct_from_neighbors."""
     ld_opt = LocalLandmarksDistanceOptimizer(
         r=r,
@@ -25,7 +27,9 @@ def construct_from_neighbors(
         expand_max_n_neighbors=expand_max_n_neighbors,
         n_iter=n_iter + 1,
         expand_max_frontier=expand_max_frontier,
-        output_k_best=output_k_best)
+        max_size_frontier=max_size_frontier,
+        output_k_best=output_k_best,
+        adapt_grammar_n_iter=adapt_grammar_n_iter)
     graphs = ld_opt.optimize(
         landmark_graphs,
         desired_distances,
